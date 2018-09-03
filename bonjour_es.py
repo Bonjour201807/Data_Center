@@ -1,182 +1,323 @@
 from elasticsearch import Elasticsearch
+from elasticsearch.helpers import bulk
 import csv
 import os
+import re
 import time
 import json
+import random
 
 datapath = '/home/ubuntu/data/bonjour/data'
 os.chdir(datapath)
-attributes_list = ['id','name', 'intro', 'lng','lat','tags', 'plays', 'supplement']
-
-attractions_id = {}
-tags = {}
+city_province = {}
+adcode_loc = {}
 
 
 class Bonjour_ES:
     es = Elasticsearch([{"host": "127.0.0.1", "port": 9200, "timeout": 3600}])
+    with open('area.csv') as f:
+        ff = csv.reader(f)
+        for line in ff:
+            adcode_loc[line[0]] = line[2] + ',' + line[3]
 
     def __init__(self):
-        if self.es.indices.exists(index='bonjour') is not True:
-            print("bonjour 开始创建！")
-            print("bonjour_id 开始创建！")
-            print("bonjour_tags 开始创建！")
-            print("bonjour_recommend 开始创建！")
-            bonjour_index = {
-                "settings": {
-                    "analysis": {
-                        "analyzer": {
-                            "bonjour_analyzer": {
-                                "type": "ik_smart",
-                                "stopwords_path": "stopwords.txt",
-                                "max_token_length": 8,
-                                "search_analyzer": "ik_smart"
-                            }
-                        }
-                    }
-                },
-                # "mappings": {
-                #     "attractions": {
-                #         "_all": {
-                #             "type": "text",
-                #             "fields": {
-                #                 "cn": {
-                #                     "type": "text",
-                #                     "analyzer": "ik_smart",
-                #                     "search_analyzer": "ik_smart"
-                #                 },
-                #                 "en": {
-                #                     "type": "text",
-                #                     "analyzer": "english",
-                #                     "search_analyzer": "english",
-                #                 }
-                #             }
-                #         }
-                #     }
-                # }
-            }
-            ret_bonjour = self.es.indices.create(index='bonjour', body=bonjour_index, ignore=400)
-            print(ret_bonjour)
-            ret_bonjour_id = self.es.indices.create(index='bonjour_id', body=bonjour_index, ignore=400)
-            print(ret_bonjour_id)
-            ret_bonjour_tags = self.es.indices.create(index='bonjour_tags', body=bonjour_index, ignore=400)
-            print(ret_bonjour_tags)
-            ret_bonjour_recommend = self.es.indices.create(index='bonjour_recommend', body=bonjour_index, ignore=400)
-            print(ret_bonjour_recommend)
-            rootdir = 'pics'
-            pics = {}
-            for parent, dirnames, filenames in os.walk(rootdir):
-                attractionsname = parent.split('/')[-1]
-                pic = []
-                for filename in filenames:
-                    filepath = os.path.join(parent, filename)
-                    filesplit = filename.split('-')
-                    if len(filesplit) == 1:
-                        filesplit = filename.split('.')
-                    tag = filesplit[0]
-                    if len(filesplit) <= 2:
-                        name = tag
-                    else:
-                        name = filesplit[1]
-                    pic.append({'tag': tag, 'name': name, 'filepath': filepath})
-                if (attractionsname == 'pics'):
-                    continue
-                pics[attractionsname] = pic
-            with open('bonjour.csv', 'r', encoding='utf8') as f:
-                linenum = -1
-                for line in csv.reader(f):
-                    linenum += 1
-                    if linenum == 0:
-                        continue
-                    attractions = {}
-                    attractions['id'] = linenum
-                    for u, v in enumerate(line):
-                        if attributes_list[u] == "tags":
-                            values = list(v.split('、'))
-                            for value in values:
-                                if value not in tags:
-                                    tags[value] = []
-                                tags[value].append(linenum)
-                        if attributes_list[u] == "tags" or attributes_list[u] == "plays":
-                            value = list(v.split('、'))
-                            attractions[attributes_list[u]] = value
-                        else:
-                            attractions[attributes_list[u]] = v
-                    attractions['pic'] = pics[line[0]]
-                    self.es.index(index='bonjour', doc_type='attractions', refresh=True, body=attractions, id=linenum)
-                    name_id = {}
-                    name_id['name'] = line[0]
-                    name_id['id'] = linenum
-                    self.es.index(index='bonjour_id', doc_type='attractions', refresh=True, body=name_id)
-                    self.es.index(index='bonjour_recommend', doc_type='recommend', refresh=True, body={'name': line[0]})
-            for tag in tags:
-                self.es.index(index='bonjour_tags', doc_type='tags', refresh=True,
-                              body={'tag': tag, 'attractions_id_list': tags[tag]})
-                self.es.index(index='bonjour_recommend', doc_type='recommend', refresh=True, body={'name': tag})
-            print('bonjour 创建结束！')
-            print('bonjour_id 创建结束！')
-            print('bonjour_tags 创建结束！')
-            print("bonjour_recommend 创建结束！")
-        else:
-            query = {'query': {'match_all': {}}}
-            allDoc = self.es.search(index='bonjour_id', doc_type='attractions', body=query)
-            for doc in allDoc['hits']['hits']:
-                attractions_id[doc['_source']['name']] = doc['_source']['id']
-            allDoc = self.es.search(index='bonjour_tags', doc_type='tags', body=query)
-            for doc in allDoc['hits']['hits']:
-                tags[doc['_source']['tag']] = doc['_source']['attractions_id_list']
+        search = {'query': {'match_all': {}}}
+        allDoc = self.es.search(index='bonjour_citys', doc_type='city', size=10000, body=search)
+        for doc in allDoc['hits']['hits']:
+            city_province[doc['_source']['city']] = doc['_source']['province']
 
-    def add(self):
-        return None
-
-    def delete(self):
-        return None
-
-    def updata(self):
-        return None
-
-    def search_recommend(self, query):
+    def get_spots_by_loc_distance(self, params):
         returnlist = []
-        search = {'query': {'match': {'name': query}}}
-        allDoc = self.es.search(index='bonjour_recommend', doc_type='recommend', body=search)
+        geo_dict = {"geo_distance": {"unit": "km", "distance": params['distance'], "location": params['loc']}}
+        search = {"query": {"bool": {"filter": geo_dict}}}
+        allDoc = self.es.search(index='bonjour', doc_type='spot', body=search, from_=int(params['from_page']),
+                                size=int(params['size']))
+        for doc in allDoc['hits']['hits']:
+            item = doc['_source']
+            returnlist.append(
+                {'sid': item['sid'], 'name': item['name'], 'tags': item['tags'], 'images': item['images']})
+        return {'data': returnlist}
+
+    def get_spots_by_loc_distance_range(self, params):
+        returnlist = []
+        geo_dict_max = {"geo_distance": {"unit": "km", "distance": params['dismax'], "location": params['loc']}}
+        geo_dict_min = {"geo_distance": {"unit": "km", "distance": params['dismin'], "location": params['loc']}}
+        search = {"query": {'bool': {"filter": {'bool': {'must': geo_dict_max, 'must_not': geo_dict_min}}}}}
+        allDoc = self.es.search(index='bonjour', doc_type='spot', body=search, from_=int(params['from_page']),
+                                size=int(params['size']))
+        for doc in allDoc['hits']['hits']:
+            item = doc['_source']
+            returnlist.append(
+                {'sid': item['sid'], 'name': item['name'], 'tags': item['tags'], 'images': item['images']})
+        return {'data': returnlist}
+
+    def get_spots_by_loc_distance_tags(self, params):
+        returnlist = []
+        tags_string = ''
+        for tag in json.loads(params['tags']):
+            tags_string += tag + ' '
+        geo_dict = {"geo_distance": {"unit": "km", "distance": params['distance'], "location": params['loc']}}
+        search = {"query": {"bool": {"should": {"match": {'tags_string': tags_string}, }, "filter": geo_dict}}}
+        allDoc = self.es.search(index='bonjour', doc_type='spot', body=search, from_=int(params['from_page']),
+                                size=int(params['size']))
+        for doc in allDoc['hits']['hits']:
+            print(doc['_score'])
+            item = doc['_source']
+            returnlist.append(
+                {'sid': item['sid'], 'name': item['name'], 'tags': item['tags'], 'images': item['images']})
+        return {'data': returnlist}
+
+    def get_spots_by_loc_distance_tags_range(self, params):
+        returnlist = []
+        tags_string = ''
+        for tag in json.loads(params['tags']):
+            tags_string += tag + ' '
+        geo_dict_max = {"geo_distance": {"unit": "km", "distance": params['dismax'], "location": params['loc']}}
+        geo_dict_min = {"geo_distance": {"unit": "km", "distance": params['dismin'], "location": params['loc']}}
+        search = {"query": {"bool": {"should": {"match": {'tags_string': tags_string}, },
+                                     "filter": {'bool': {'must': geo_dict_max, 'must_not': geo_dict_min}}}}}
+        allDoc = self.es.search(index='bonjour', doc_type='spot', body=search, from_=int(params['from_page']),
+                                size=int(params['size']))
+        for doc in allDoc['hits']['hits']:
+            item = doc['_source']
+            returnlist.append(
+                {'sid': item['sid'], 'name': item['name'], 'tags': item['tags'], 'images': item['images']})
+        return {'data': returnlist}
+
+    def get_tags_by_loc_distance(self, params):
+        print(params)
+        returnlist = []
+        geo_dict = {"geo_distance": {"unit": "km", "distance": params['distance'], "location": params['loc']}}
+        search = {"query": {"bool": {"filter": geo_dict}}}
+        allDoc = self.es.search(index='bonjour', doc_type='spot', body=search, from_=int(params['from_page']),
+                                size=int(params['size']))
+        tags = {}
+        for doc in allDoc['hits']['hits']:
+            for tag in doc['_source']['tags']:
+                tags[tag] = 0
+        t = 0
+        for tag in tags:
+            returnlist.append(tag)
+            t += 1
+            if t == int(params['size']): break
+        return {'data': returnlist}
+
+    def get_tags_by_loc_distance_range(self, params):
+        returnlist = []
+        geo_dict_max = {"geo_distance": {"unit": "km", "distance": params['dismax'], "location": params['loc']}}
+        geo_dict_min = {"geo_distance": {"unit": "km", "distance": params['dismin'], "location": params['loc']}}
+        search = {"query": {'bool': {"filter": {'bool': {'must': geo_dict_max, 'must_not': geo_dict_min}}}}}
+        allDoc = self.es.search(index='bonjour', doc_type='spot', body=search, from_=int(params['from_page']),
+                                size=int(params['size']))
+        tags = {}
+        for doc in allDoc['hits']['hits']:
+            for tag in doc['_source']['tags']:
+                tags[tag] = 0
+        t = 0
+        for tag in tags:
+            returnlist.append(tag)
+            t += 1
+            if t == int(params['size']): break
+        return {'data': returnlist}
+
+    def get_tags_by_city(self, params):
+        returnlist = []
+        search = {'query': {'match': {'city': params['city']}}}
+        allDoc = self.es.search(index='bonjour_tags', doc_type='tag', from_=int(params['from_page']),
+                                size=int(params['size']),
+                                body=search)
+        for doc in allDoc['hits']['hits']:
+            returnlist.append(doc['_source']['tag'])
+        return {'data': returnlist}
+
+    def get_recommend(self, params):
+        returnlist = []
+        search = {'query': {'match': {'name': params['query']}}}
+        allDoc = self.es.search(index='bonjour_recommend', doc_type='recommend', from_=int(params['from_page']),
+                                size=int(params['size']),
+                                body=search)
         for doc in allDoc['hits']['hits']:
             returnlist.append(doc['_source']['name'])
-        return returnlist
+        return {'data': returnlist}
 
-    def search(self, search_data):
+    def get_tags_by_adcode_days(self, params):
         returnlist = []
-        if search_data['query'] in attractions_id:
-            returnlist.append(
-                self.es.get(index='bonjour', doc_type='attractions', id=attractions_id[search_data['query']])[
-                    '_source'])
-            return {'flag': 0, 'data': returnlist}
-        for name in attractions_id:
-            returnlist.append(self.es.get(index='bonjour', doc_type='attractions', id=attractions_id[name])['_source'])
-        return {'flag': 1, 'data': returnlist}
+        if days <= 1:
+            dismax = 100
+            dismin = -1
+        elif days <= 2:
+            dismax = 300
+            dismin = 100
+        elif days <= 3:
+            dismax = 800
+            dismin = 300
+        elif days <= 4:
+            dismax = 2000
+            dismin = 800
+        else:
+            dismax = 5000
+            dismin = 2000
 
-    def get_tags(self):
-        returnlist = []
+        geo_dict_max = {"geo_distance": {"unit": "km", "distance": dismax, "location": adcode_loc[params['adcode']]}}
+        geo_dict_min = {"geo_distance": {"unit": "km", "distance": dismin, "location": adcode_loc[params['adcode']]}}
+        search = {"query": {'bool': {"filter": {'bool': {'must': geo_dict_max, 'must_not': geo_dict_min}}}}}
+        allDoc = self.es.search(index='bonjour', doc_type='spot', from_=int(params['from_page']),
+                                size=int(params['size']),
+                                body=search)
+        tags = {}
+        for doc in allDoc['hits']['hits']:
+            for tag in doc['_source']['tags']:
+                tags[tag] = 0
+        t = 0
         for tag in tags:
-            returnlist.append({'tag':tag,'attractions_id_list':tags[tag]})
-        return returnlist
+            returnlist.append(tag)
+            t += 1
+            if t == int(params['size']): break
+        return {'data': returnlist}
 
-    def get_attractions(self, id):
+    def get_spots_by_adcode_tags_days(self, params):
+        returnlist = []
+        if days <= 1:
+            dismax = 100
+            dismin = -1
+        elif days <= 2:
+            dismax = 300
+            dismin = 100
+        elif days <= 3:
+            dismax = 800
+            dismin = 300
+        elif days <= 4:
+            dismax = 2000
+            dismin = 800
+        else:
+            dismax = 5000
+            dismin = 2000
+
+        geo_dict_max = {"geo_distance": {"unit": "km", "distance": dismax, "location": adcode_loc[params['adcode']]}}
+        geo_dict_min = {"geo_distance": {"unit": "km", "distance": dismin, "location": adcode_loc[params['adcode']]}}
+        if 'tags_string' in params:
+            tags_string = params['tags_string']
+        else:
+            tags_string = ''
+            for tag in params['tags']:
+                tags_string += tag + ' '
+        search = {"query": {'bool': {'should': {"match": {"tags_string": tags_string}},
+                                     "filter": {'bool': {'must': geo_dict_max, 'must_not': geo_dict_min}}}}}
+        allDoc = self.es.search(index='bonjour', doc_type='spot', from_=int(params['from_page']),
+                                size=int(params['size']), body=search)
+        for doc in allDoc['hits']['hits']:
+            item = doc['_source']
+            returnlist.append(
+                {'sid': item['sid'], 'name': item['name'], 'tags': item['tags'], 'images': item['images']})
+        return {'data': returnlist}
+
+    def get_spots_by_query_adcode_tags_days(self, params):
+        returnlist = []
+        if days <= 1:
+            dismax = 100
+            dismin = -1
+        elif days <= 2:
+            dismax = 300
+            dismin = 100
+        elif days <= 3:
+            dismax = 800
+            dismin = 300
+        elif days <= 4:
+            dismax = 2000
+            dismin = 800
+        else:
+            dismax = 5000
+            dismin = 2000
+
+        geo_dict_max = {"geo_distance": {"unit": "km", "distance": dismax, "location": adcode_loc[params['adcode']]}}
+        geo_dict_min = {"geo_distance": {"unit": "km", "distance": dismin, "location": adcode_loc[params['adcode']]}}
+        if 'tags_string' in params:
+            tags_string = params['tags_string']
+        else:
+            tags_string = ''
+            for tag in params['tags']:
+                tags_string += tag + ' '
+        search = {"query": {
+            'bool': {'should': [{"match": {"tags_string": tags_string}}, {"match": {"name": params['query']}}],
+                     "filter": {'bool': {'must': geo_dict_max, 'must_not': geo_dict_min}}}}}
+        allDoc = self.es.search(index='bonjour', doc_type='spot', from_=int(params['from_page']),
+                                size=int(params['size']), body=search)
+        for doc in allDoc['hits']['hits']:
+            item = doc['_source']
+            returnlist.append(
+                {'sid': item['sid'], 'name': item['name'], 'tags': item['tags'], 'images': item['images']})
+        return {'data': returnlist}
+
+    def get_spots_by_tag(self, params):
+        returnlist = []
+        search = {'query': {'match': {'tags_string': params['tag']}}}
+        allDoc = self.es.search(index='bonjour', doc_type='spot', from_=int(params['from_page']),
+                                size=int(params['size']), body=search)
+        for doc in allDoc['hits']['hits']:
+            item = doc['_source']
+            returnlist.append(
+                {'sid': item['sid'], 'name': item['name'], 'tags': item['tags'], 'images': item['images']})
+        return {'data': returnlist}
+
+    def get_spot(self, params):
         try:
-            ret = self.es.get(index='bonjour', doc_type='attractions', id=id)['_source']
+            ret = self.es.get(index='bonjour', doc_type='spot', id=params['sid'])['_source']
             return ret
         except:
             return None
 
-    def get_weather(self, reqdata):
-        return None
+    def get_nearby(self, params):
+        returnlist = []
+        now_spot = self.get_spot(params)
+        search = {'query': {
+            'bool': {'must': [{'match': {'district': now_spot['district']}}, {'match': {'city': now_spot['city']}}]}}}
+        allDoc = self.es.search(index='bonjour', doc_type='spot', from_=int(params['from_page']),
+                                size=int(params['from_page']) + 1,
+                                body=search)
+        if len(allDoc['hits']['hits']) < 2:
+            search = {'query': {'match': {'city': now_spot['city']}}}
+            allDoc = self.es.search(index='bonjour', doc_type='spot', from_=int(params['from_page']),
+                                    size=int(params['from_page']) + 1,
+                                    body=search)
+        if len(allDoc['hits']['hits']) < 2:
+            search = {'query': {'match': {'province': now_spot['province']}}}
+            allDoc = self.es.search(index='bonjour', doc_type='spot', from_=int(params['from_page']),
+                                    size=int(params['from_page']) + 1,
+                                    body=search)
+        for doc in allDoc['hits']['hits']:
+            if doc['_source']['sid'] != params['sid']:
+                item = doc['_source']
+                returnlist.append(
+                    {'sid': item['sid'], 'name': item['name'], 'tags': item['tags'], 'images': item['images']})
+        return {'data': returnlist}
 
-    def get_position(self, reqdata):
-        return None
+    def get_similar(self, params):
+        returnlist = []
+        now_spot = self.get_spot(params)
+        search = {'query': {'bool': {
+            'must': [{'match': {'tags_string': now_spot['tags_string']}}, {'match': {'city': now_spot['city']}}]}}}
+        allDoc = self.es.search(index='bonjour', doc_type='spot', from_=int(params['from_page']),
+                                size=int(params['size']) + 1,
+                                body=search)
+        if len(allDoc['hits']['hits']) < 2:
+            search = {'query': {'bool': {
+                'must': [{'match': {'tags_string': now_spot['tags_string']}},
+                         {'match': {'province': now_spot['province']}}]}}}
+            allDoc = self.es.search(index='bonjour', doc_type='spot', from_=int(params['from_page']),
+                                    size=int(params['size']) + 1,
+                                    body=search)
+        if len(allDoc['hits']['hits']) < 2:
+            search = {'query': {'match': {'tags_string': now_spot['tags_string']}}}
+            allDoc = self.es.search(index='bonjour', doc_type='spot', from_=int(params['from_page']),
+                                    size=int(params['size']) + 1,
+                                    body=search)
+        for doc in allDoc['hits']['hits']:
+            if doc['_source']['sid'] != params['sid']:
+                item = doc['_source']
+                returnlist.append(
+                    {'sid': item['sid'], 'name': item['name'], 'tags': item['tags'], 'images': item['images']})
+        return {'data': returnlist}
 
 
 es = Bonjour_ES()
-es = Elasticsearch([{"host": "127.0.0.1", "port": 9200, "timeout": 3600}])
 print("你好啊！！！")
-es.indices.delete(index='bonjour')
-es.indices.delete(index='bonjour_id')
-es.indices.delete(index='bonjour_tags')
-es.indices.delete(index='bonjour_recommend')
